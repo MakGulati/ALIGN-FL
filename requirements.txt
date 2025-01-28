@@ -1,0 +1,16 @@
+# Add your project dependencies here
+python=3.9.18=h0755675_1_cpython
+torch=2.3.1=pypi_0
+scikit-learn=1.5.1=pypi_0
+scipy=1.13.1=pypi_0
+ray=2.32.0=pypi_0
+prv-accountant=0.2.0=pypi_0
+pandas=2.2.2=pypi_0
+numpy=1.26.4=pypi_0
+matplotlib=3.9.1=pypi_0
+joblib=1.4.2=pypi_0
+flwr=1.9.0=pypi_0
+protobuf=4.25.3=pypi_0
+torchsummary=1.5.1=pypi_0
+torchvision=0.18.1=pypi_0
+wandb=0.17.7=pypi_0
