@@ -35,6 +35,7 @@ from ..utils.gen_utils import (
     local_model_train_only,
     SimpleVAE,
     local_model_train_only_with_dp,
+    local_model_train_only_enc_penalty,
 )
 from ..utils.utils_server import sample_and_visualize, set_seed
 import numpy as np

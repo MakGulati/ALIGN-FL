@@ -35,6 +35,7 @@ warnings.filterwarnings(
 )
 warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
 
+
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -184,6 +185,7 @@ def mse_loss_function_with_gp(
     BETA=1.0,
     use_gp=True,
     gradient_penalty_weight=0.1,
+    penalty_at="decoder",
 ):
     # Normalize reconstruction loss by batch size
     MSE = F.mse_loss(recon_batch, data.view(-1, 784), reduction="none").sum(dim=1)
@@ -201,7 +203,10 @@ def mse_loss_function_with_gp(
         z = model.reparameterize(mu, log_var)
 
         # Compute GP on both real latents and random samples
-        gp_real = compute_lipschitz_penalty(model, z)
+        if penalty_at == "decoder":
+            gp_real = compute_lipschitz_penalty(model, z)
+        else:
+            gp_real = compute_lipschitz_penalty_encoder(model, data)
 
         gp = gp_real
 
@@ -245,6 +250,44 @@ def compute_lipschitz_penalty(model, z, epsilon=1e-7):
         gradients = gradients.view(gradients.size(0), -1)
         gradients_norm = torch.sqrt(torch.sum(gradients**2, dim=1) + epsilon)
         # lipschitz_penalty = torch.mean((torch.relu(gradients_norm - threshold)) ** 2)
+        lipschitz_penalty = torch.mean((gradients_norm - 1) ** 2)
+
+    return lipschitz_penalty
+
+
+def compute_lipschitz_penalty_encoder(model, x, epsilon=1e-7):
+
+    # Sample random points between input samples
+    x = x.view(-1, 784)
+    alpha = torch.rand(x.size(0), 1).to(x.device)
+    interpolated_x = alpha * x + (1 - alpha) * x[torch.randperm(x.size(0))]
+    interpolated_x.requires_grad_(True)
+
+    with torch.enable_grad():
+
+        # Get encoder outputs for interpolated points
+        mu, logvar = model.encode(interpolated_x)
+        gradients_mu = torch.autograd.grad(
+            outputs=mu,
+            inputs=interpolated_x,
+            grad_outputs=torch.ones_like(mu),
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True,
+        )[0]
+        gradients_logvar = torch.autograd.grad(
+            outputs=logvar,
+            inputs=interpolated_x,
+            grad_outputs=torch.ones_like(logvar),
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True,
+        )[0]
+        gradients = gradients_mu + gradients_logvar
+
+        # Calculate Lipschitz penalty
+        gradients = gradients.view(gradients.size(0), -1)
+        gradients_norm = torch.sqrt(torch.sum(gradients**2, dim=1) + epsilon)
         lipschitz_penalty = torch.mean((gradients_norm - 1) ** 2)
 
     return lipschitz_penalty
@@ -434,6 +477,76 @@ def local_model_train_only(local_trainset, model, config):
                 lambda_kl,
                 use_gp=True,
                 gradient_penalty_weight=lambda_lip,
+            )
+
+            vae_loss.backward()
+            optimizer.step()
+            total_train_loss += vae_loss.item()
+            total_mse += mse.item()
+            total_kl_loss += kl.item()
+            total_gp_loss += gp_loss.item()
+    # Fit GMM on collected latent vectors
+    all_latent_vectors = np.concatenate(all_latent_vectors, axis=0)
+    gmm = GaussianMixture(n_components=10, covariance_type="diag", random_state=42)
+    gmm.fit(all_latent_vectors)
+    save_gmm(gmm, f"{folder}/gmm_c_{cid}_r{server_round}.joblib")
+    all_loss = {
+        "local_total_train_loss": total_train_loss / len(local_dataloader),
+        "local_total_mse": total_mse / len(local_dataloader),
+        "local_total_kl_loss": total_kl_loss / len(local_dataloader),
+        "local_total_gp_loss": total_gp_loss / len(local_dataloader),
+    }
+    # Collect latent space statistics
+    # latent_stats = collect_latent_statistics(model, local_dataloader, device)
+
+    # Save statistics
+    # np.save(f"{folder}/latent_stats_c_{cid}_r{server_round}.npy", latent_stats)
+    return all_loss, model
+
+
+def local_model_train_only_enc_penalty(local_trainset, model, config):
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.train()
+    all_latent_vectors = []
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    num_epochs = config["local_epochs"]
+    lambda_kl = config["lambda_kl"]
+    lambda_lip = config["lambda_lip"]
+    latent_dim = config["latent_dim"]
+    folder = config["folder"]
+    server_round = config["server_round"]
+    cid = config["cid"]
+    local_dataloader = DataLoader(
+        local_trainset, batch_size=config["batch_size"], shuffle=True
+    )
+
+    for epoch in range(num_epochs):
+        total_train_loss = total_lip_loss = 0
+        total_mse = 0
+        total_kl_loss = 0
+        total_gp_loss = 0
+        epoch_lip_constants = []
+
+        for batch_idx, data in enumerate(local_dataloader):
+            features = data[0].to(device)
+            optimizer.zero_grad()
+
+            recon_batch, mu, log_var = model(features)
+            z = model.reparameterize(mu, log_var)
+            all_latent_vectors.append(z.detach().cpu().numpy())
+
+            vae_loss, mse, kl, gp_loss = mse_loss_function_with_gp(
+                model,
+                features,
+                recon_batch,
+                mu,
+                log_var,
+                lambda_kl,
+                use_gp=True,
+                gradient_penalty_weight=lambda_lip,
+                penalty_at="encoder",
             )
 
             vae_loss.backward()
