@@ -85,7 +85,7 @@ LATENT_DIM = args.latent_dim
 IDENTIFIER = args.identifier
 NUM_CLIENTS = args.num_clients
 NUM_CLASSES = 2 * args.num_clients
-IDENTIFIER_FOLDER = f"fed_align_{args.data_type}/{IDENTIFIER}"
+IDENTIFIER_FOLDER = f"align_fl_{args.data_type}/{IDENTIFIER}"
 if not os.path.exists(IDENTIFIER_FOLDER):
     os.makedirs(IDENTIFIER_FOLDER)
 

@@ -41,6 +41,7 @@ data
 # Training logs
 fed_align/
 fed_align_*/
+align_fl_*
 fed_avg/
 fed_prox/
 wandb/

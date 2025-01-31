@@ -1,6 +1,6 @@
 # ALIGN_FL
 
-A Federated Learning framework implementing various strategies including FedAlign, FedAvg, and FedProx, with support for differential privacy and various datasets.
+A Federated Learning framework implementing various strategies including ALIGN_FL, FedAvg, and FedProx, with support for differential privacy and various datasets.
 
 ## Installation
 
@@ -15,9 +15,9 @@ pip install -e .
 
 The framework provides several runner scripts for different federated learning strategies:
 
-1. FedAlign VAE:
+1. ALIGN_FL VAE:
 ```bash
-python -m ALIGN_FL.runner.sim_fed_align_vae [options]
+python -m ALIGN_FL.runner.sim_align_fl_vae [options]
 ```
 
 2. FedAvg VAE:
@@ -42,21 +42,21 @@ python -m ALIGN_FL.runner.sim_fed_prox_vae [options]
 
 ### Example Commands
 
-#### FedAlign with MNIST
+#### ALIGN_FL with MNIST
 ```bash
 # No DP-SGD, Lip=0
-python -m ALIGN_FL.runner.sim_fed_align_vae -i fedalign_out_percent5_no_dp_lip0 -c 5 -dp no_dp -dim 2 -r 5 -lip 0 -dt mnist
+python -m ALIGN_FL.runner.sim_align_fl_vae -i align_fl_out_percent5_no_dp_lip0 -c 5 -dp no_dp -dim 2 -r 5 -lip 0 -dt mnist
 
 # No DP-SGD, Lip=0.1
-python -m ALIGN_FL.runner.sim_fed_align_vae -i fedalign_out_percent5_no_dp_lip0.1 -c 5 -dp no_dp -dim 2 -r 5 -lip 0.1 -dt mnist
+python -m ALIGN_FL.runner.sim_align_fl_vae -i align_fl_out_percent5_no_dp_lip0.1 -c 5 -dp no_dp -dim 2 -r 5 -lip 0.1 -dt mnist
 
 # Full DP-SGD, Lip=0
-python -m ALIGN_FL.runner.sim_fed_align_vae -i fedalign_out_percent5_full_dp_lip0 -c 5 -dp full_dp -dim 2 -r 5 -lip 0 -dt mnist
+python -m ALIGN_FL.runner.sim_align_fl_vae -i align_fl_out_percent5_full_dp_lip0 -c 5 -dp full_dp -dim 2 -r 5 -lip 0 -dt mnist
 ```
 
-#### FedAlign with Fashion MNIST
+#### ALIGN_FL with Fashion MNIST
 ```bash
-python -m ALIGN_FL.runner.sim_fed_align_vae -i fedalign_out_percent5_no_dp_lip0 -c 5 -dp no_dp -dim 2 -r 5 -lip 0 -dt fmnist
+python -m ALIGN_FL.runner.sim_align_fl_vae -i align_fl_out_percent5_no_dp_lip0 -c 5 -dp no_dp -dim 2 -r 5 -lip 0 -dt fmnist
 ```
 
 #### Other Strategies
@@ -83,7 +83,7 @@ ALIGN_FL/
 ## Features
 
 - Multiple federated learning strategies:
-  - FedAlign with VAE
+  - ALIGN_FL with VAE
   - FedAvg with VAE
   - FedProx with VAE
 - Differential privacy support
