@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
 from torchvision.models import inception_v3
+from torchmetrics.image.inception import InceptionScore
+
 from scipy.linalg import sqrtm
 
 import numpy as np
@@ -34,6 +36,11 @@ warnings.filterwarnings(
     "ignore", category=FutureWarning, module="sklearn.linear_model._logistic"
 )
 warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
+
+warnings.filterwarnings(
+    "ignore",
+    message="Metric `InceptionScore` will save all extracted features in buffer.*",
+)
 
 
 def set_seed(seed):
@@ -199,19 +206,21 @@ def mse_loss_function_with_gp(
     # Increased KLD weight to constrain latent space
     loss = MSE + BETA * KLD
 
-    if use_gp:
+    if use_gp and gradient_penalty_weight > 0:
         z = model.reparameterize(mu, log_var)
 
         # Compute GP on both real latents and random samples
         if penalty_at == "decoder":
+            print("Computing GP at decoder")
             gp_real = compute_lipschitz_penalty(model, z)
         else:
+            print("Computing GP at encoder")
             gp_real = compute_lipschitz_penalty_encoder(model, data)
 
         gp = gp_real
 
         loss = loss + gradient_penalty_weight * gp
-    return loss, MSE, KLD, gp if use_gp else None
+    return loss, MSE, KLD, gp if (use_gp and gradient_penalty_weight > 0) else None
 
 
 class SampleDataset(Dataset):
@@ -484,7 +493,7 @@ def local_model_train_only(local_trainset, model, config):
             total_train_loss += vae_loss.item()
             total_mse += mse.item()
             total_kl_loss += kl.item()
-            total_gp_loss += gp_loss.item()
+            total_gp_loss += gp_loss.item() if lambda_lip > 0 else 0
     # Fit GMM on collected latent vectors
     all_latent_vectors = np.concatenate(all_latent_vectors, axis=0)
     gmm = GaussianMixture(n_components=10, covariance_type="diag", random_state=42)
@@ -554,7 +563,7 @@ def local_model_train_only_enc_penalty(local_trainset, model, config):
             total_train_loss += vae_loss.item()
             total_mse += mse.item()
             total_kl_loss += kl.item()
-            total_gp_loss += gp_loss.item()
+            total_gp_loss += gp_loss.item() if lambda_lip > 0 else 0
     # Fit GMM on collected latent vectors
     all_latent_vectors = np.concatenate(all_latent_vectors, axis=0)
     gmm = GaussianMixture(n_components=10, covariance_type="diag", random_state=42)
@@ -623,7 +632,7 @@ def standard_local_model_train(local_trainset, model, config):
             total_train_loss += vae_loss.item()
             total_mse += mse.item()
             total_kl_loss += kl.item()
-            total_gp_loss += gp_loss.item()
+            total_gp_loss += gp_loss.item() if lambda_lip > 0 else 0
 
     all_loss = {
         "local_total_train_loss": total_train_loss / len(local_dataloader),
@@ -703,7 +712,7 @@ def standard_local_model_train_prox(local_trainset, model, config, global_model)
             total_train_loss += total_loss.item()
             total_mse += mse.item()
             total_kl_loss += kl.item()
-            total_gp_loss += gp_loss.item()
+            total_gp_loss += gp_loss.item() if lambda_lip > 0 else 0
             total_prox_loss += proximal_term.item()
 
     # Average losses
@@ -857,25 +866,68 @@ def visualize_latent_space(model, test_loader, device, filename=None, folder=Non
 
     # If latent dimension > 2, use PCA to reduce to 2D
     if z_points.shape[1] > 2:
-        # Set random seed for reproducibility
-        np.random.seed(42)
+        np.random.seed(42)  # For reproducibility
         pca = PCA(n_components=2)
         z_points = pca.fit_transform(z_points)
-
-        # Optional: print explained variance ratio
         print(f"Explained variance ratio: {pca.explained_variance_ratio_}")
 
+    # Set figure and font sizes
+    plt.rcParams.update(
+        {
+            "font.size": 12,
+            "axes.labelsize": 14,
+            "axes.titlesize": 16,
+            "xtick.labelsize": 14,
+            "ytick.labelsize": 14,
+            "legend.fontsize": 14,
+        }
+    )
+
+    # Create figure with reasonable size
     plt.figure(figsize=(10, 8))
-    scatter = plt.scatter(z_points[:, 0], z_points[:, 1], c=labels, cmap="tab10")
-    plt.colorbar(scatter)
+
+    # Create scatter plot
+    scatter = plt.scatter(
+        z_points[:, 0],
+        z_points[:, 1],
+        c=labels,
+        cmap="tab10",
+        s=50,  # Reduced marker size
+        alpha=0.8,
+    )
+
+    # Add colorbar
+    cbar = plt.colorbar(scatter)
+    cbar.ax.tick_params(labelsize=10)
+
+    # Set labels and title
     plt.xlabel("PCA1" if z_points.shape[1] > 2 else "z[0]")
     plt.ylabel("PCA2" if z_points.shape[1] > 2 else "z[1]")
     plt.title(
-        "2D Latent Space (PCA Projection)"
-        if z_points.shape[1] > 2
-        else "2D Latent Space"
+        (
+            "2D Latent Space (PCA Projection)"
+            if z_points.shape[1] > 2
+            else "2D Latent Space"
+        ),
+        pad=15,
     )
-    plt.savefig(f"{folder}/{filename}.png")
+
+    # Enhance grid and ticks
+    plt.grid(True, linestyle="--", alpha=0.7)
+    plt.tick_params(axis="both", which="major", width=1.5, length=5)
+
+    # Add tight layout before saving
+    plt.tight_layout()
+
+    # Save with adjusted quality settings
+    plt.savefig(
+        f"{folder}/{filename}.png",
+        format="png",
+        dpi=300,  # Reduced DPI
+        bbox_inches="tight",
+        pad_inches=0.1,
+        facecolor="white",
+    )
     plt.close()
     return f"{folder}/{filename}.png"
 
@@ -1069,47 +1121,56 @@ def load_gmm(filepath):
         return None
 
 
-def compute_fid_complete(testloader, vae_model, device, num_samples=None):
+def compute_FID_and_IS(
+    testloader, vae_model, device, num_samples=None, max_batch_size=32
+):
     """
-    Complete function to calculate FID score between real MNIST images and VAE-generated images.
-    Includes all necessary preprocessing and model setup.
+    Memory-efficient implementation to calculate both FID score and Inception Score for VAE-generated images.
 
     Args:
         testloader: DataLoader containing test images
         vae_model: Trained VAE model
         device: torch device (cuda/cpu)
         num_samples: Optional; number of samples to generate. If None, uses same size as testloader
+        max_batch_size: Maximum batch size to use for feature extraction to manage memory
 
     Returns:
-        fid: Computed FID score
+        tuple: (fid_score, inception_score, inception_score_std)
     """
-    # Set up inception model
+
+    import gc
+
+    def clear_gpu_memory():
+        """Helper function to clear GPU memory"""
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+            gc.collect()
+
+    # Set up inception model for FID
     inception = inception_v3(pretrained=True, transform_input=False)
-    inception.fc = nn.Identity()  # Use the output of the penultimate layer
+    inception.fc = nn.Identity()
     inception.eval()
     inception.to(device)
 
-    # Define transforms for single-channel images
+    # Set up InceptionScore calculator
+    inception_score_calc = InceptionScore(normalize=True).to(device)
+
     transform = transforms.Compose(
         [
             transforms.ToPILImage(),
-            transforms.Resize((299, 299)),  # Resize to Inception size
+            transforms.Resize((299, 299)),
             transforms.ToTensor(),
-            transforms.Lambda(lambda x: x.expand(3, -1, -1)),  # Expand grayscale to RGB
-            transforms.Normalize(
-                mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]
-            ),  # Normalize
+            transforms.Lambda(lambda x: x.expand(3, -1, -1)),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ]
     )
 
     def calculate_fid(real_features, generated_features):
-        # Calculate mean and covariance
         mu_r, sigma_r = real_features.mean(axis=0), np.cov(real_features, rowvar=False)
         mu_g, sigma_g = generated_features.mean(axis=0), np.cov(
             generated_features, rowvar=False
         )
 
-        # Compute FID
         diff = mu_r - mu_g
         covmean = sqrtm(sigma_r @ sigma_g)
         if np.iscomplexobj(covmean):
@@ -1117,65 +1178,177 @@ def compute_fid_complete(testloader, vae_model, device, num_samples=None):
         fid = np.sum(diff**2) + np.trace(sigma_r + sigma_g - 2 * covmean)
         return fid
 
-    def extract_features(dataloader, model):
+    def process_batch(images, process_inception_score=True):
+        """Process a batch of images and return features and processed images"""
+        if isinstance(images, list):
+            images = images[0]
+
+        batch_processed = []
+        for img in images:
+            processed_img = transform(img)
+            batch_processed.append(processed_img)
+
+        batch_tensor = torch.stack(batch_processed).to(device)
+
+        with torch.no_grad():
+            features = inception(batch_tensor)
+
+        if process_inception_score:
+            inception_score_calc.update(batch_tensor)
+
+        features_cpu = features.cpu().numpy()
+        del features
+        del batch_tensor
+        clear_gpu_memory()
+
+        return features_cpu
+
+    def extract_features(dataloader, process_inception_score=True):
         all_features = []
-        for images in dataloader:  # We ignore labels
-            if isinstance(images, list):  # Handle different DataLoader formats
-                images = images[0]
 
-            # Process each image in the batch
-            batch_processed = []
-            for img in images:
-                processed_img = transform(img)  # Will convert to RGB and resize
-                batch_processed.append(processed_img)
+        # Process in smaller batches
+        for images in dataloader:
+            if len(images) > max_batch_size:
+                # Split into smaller batches
+                for i in range(0, len(images), max_batch_size):
+                    batch = images[i : i + max_batch_size]
+                    features_cpu = process_batch(batch, process_inception_score)
+                    all_features.append(features_cpu)
+            else:
+                features_cpu = process_batch(images, process_inception_score)
+                all_features.append(features_cpu)
 
-            # Stack processed images
-            batch_tensor = torch.stack(batch_processed).to(device)
-
-            with torch.no_grad():
-                features = model(batch_tensor)
-            all_features.append(features.cpu().numpy())
         return np.concatenate(all_features, axis=0)
 
     # Set models to eval mode
     vae_model.eval()
 
-    # Extract real features from testloader
-    real_features = extract_features(testloader, inception)
+    # Extract real features from testloader for FID
+    print("Processing real images...")
+    real_features = extract_features(testloader)
+    clear_gpu_memory()
 
     # If num_samples not specified, match the size of test set
     if num_samples is None:
         num_samples = len(testloader.dataset)
 
-    # Generate images using the VAE
+    # Generate images using the VAE in smaller batches
+    print("Generating images...")
     generated_images = []
-    batch_size = testloader.batch_size
+    batch_size = min(testloader.batch_size, max_batch_size)
     num_batches = (num_samples + batch_size - 1) // batch_size
 
     with torch.no_grad():
         for i in range(num_batches):
             current_batch_size = min(batch_size, num_samples - i * batch_size)
-            # Sample from standard normal distribution
             z = torch.randn(current_batch_size, vae_model.latent_dim).to(device)
-
-            # Generate images through the decoder
             generated = vae_model.decode(z).reshape(current_batch_size, 1, 28, 28)
-
             generated_images.append(generated.cpu())
+            clear_gpu_memory()
 
     # Concatenate all generated images
     generated_images = torch.cat(generated_images, dim=0)
 
-    # Create a DataLoader for the generated images
+    # Create a DataLoader for the generated images with controlled batch size
     generated_loader = torch.utils.data.DataLoader(
         generated_images, batch_size=batch_size, shuffle=False
     )
 
-    # Extract features from generated images
-    generated_features = extract_features(generated_loader, inception)
+    # Extract features from generated images for FID
+    print("Processing generated images...")
+    generated_features = extract_features(generated_loader)
 
-    # Calculate and return FID
-    return calculate_fid(real_features, generated_features)
+    # Calculate FID
+    print("Calculating FID score...")
+    fid_score = calculate_fid(real_features, generated_features)
+
+    # Calculate Inception Score
+    print("Calculating Inception Score...")
+    is_mean, is_std = inception_score_calc.compute()
+
+    # Final cleanup
+    clear_gpu_memory()
+
+    return fid_score, is_mean.item(), is_std.item()
+
+
+def compute_real_IS(testloader, device, max_batch_size=32):
+    """
+    Memory-efficient implementation to calculate Inception Score for real images.
+
+    Args:
+        testloader: DataLoader containing test images
+        device: torch device (cuda/cpu)
+        max_batch_size: Maximum batch size to use for feature extraction to manage memory
+
+    Returns:
+        tuple: (inception_score_mean, inception_score_std)
+    """
+    import gc
+    import torch
+    from torchvision.models import inception_v3
+    from torchvision import transforms
+    from torch import nn
+
+    def clear_gpu_memory():
+        """Helper function to clear GPU memory"""
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+            gc.collect()
+
+    # Set up InceptionScore calculator
+    inception_score_calc = InceptionScore(normalize=True).to(device)
+
+    transform = transforms.Compose(
+        [
+            transforms.ToPILImage(),
+            transforms.Resize((299, 299)),
+            transforms.ToTensor(),
+            transforms.Lambda(
+                lambda x: x.expand(3, -1, -1)
+            ),  # Expand single channel to 3 channels
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ]
+    )
+
+    def process_batch(images):
+        """Process a batch of images for Inception Score calculation"""
+        if isinstance(images, list):
+            images = images[0]
+
+        batch_processed = []
+        for img in images:
+            processed_img = transform(img)
+            batch_processed.append(processed_img)
+
+        batch_tensor = torch.stack(batch_processed).to(device)
+
+        with torch.no_grad():
+            inception_score_calc.update(batch_tensor)
+
+        del batch_tensor
+        clear_gpu_memory()
+
+    print("Processing images for Inception Score calculation...")
+
+    # Process images in smaller batches
+    for images in testloader:
+        if len(images) > max_batch_size:
+            # Split into smaller batches
+            for i in range(0, len(images), max_batch_size):
+                batch = images[i : i + max_batch_size]
+                process_batch(batch)
+        else:
+            process_batch(images)
+
+    # Calculate Inception Score
+    print("Calculating Inception Score...")
+    is_mean, is_std = inception_score_calc.compute()
+
+    # Final cleanup
+    clear_gpu_memory()
+
+    return is_mean.item(), is_std.item()
 
 
 def evaluate_vae_encoder_split(vae_model, test_loader, device):

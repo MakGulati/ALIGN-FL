@@ -25,7 +25,7 @@ from ..utils.basic_utils import (
 from ..utils.gen_utils import (
     visualize_gen_image,
     visualize_latent_space,
-    compute_fid_complete,
+    compute_FID_and_IS,
     make_module_dp,
     get_noise_multiplier,
     compute_epoch_lipschitz_constant,
@@ -377,7 +377,9 @@ def main():
             )
 
             global_val_loss, global_val_accu, global_clf_loss = 0, 0, 0
-            global_fid = compute_fid_complete(testloader_wthout_ol, model, device, None)
+            global_fid, IS_mean, _ = compute_FID_and_IS(
+                testloader_wthout_ol, model, device, None, 32
+            )
             lip_cons_model = compute_epoch_lipschitz_constant(
                 model, testloader_wthout_ol, device, mode="complete"
             )
@@ -385,7 +387,13 @@ def main():
                 model, testloader_wthout_ol, device, mode="decoder"
             )
             metrics, _ = evaluate_vae_encoder_split(model, testloader_wthout_ol, device)
-
+            latent_reps_wthout_ol = visualize_latent_space(
+                model,
+                testloader_wthout_ol,
+                device,
+                filename=f"server_eval_wo_{server_round}",
+                folder=IDENTIFIER_FOLDER,
+            )
             arbitrary_samples = sample_and_visualize(
                 model,
                 device,
@@ -403,6 +411,11 @@ def main():
                         wandb.Image(latent_reps)
                         if isinstance(latent_reps, str)
                         else latent_reps
+                    ),
+                    f"global_latent_rep_wo_outlier": (
+                        wandb.Image(latent_reps_wthout_ol)
+                        if isinstance(latent_reps_wthout_ol, str)
+                        else latent_reps_wthout_ol
                     ),
                     f"global_arbitrary_samples": wandb.Image(arbitrary_samples),
                     # f"global_val_loss": global_val_loss,

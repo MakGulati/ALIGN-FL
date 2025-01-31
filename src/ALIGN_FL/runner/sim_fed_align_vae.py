@@ -24,7 +24,8 @@ from ..utils.basic_utils import (
 from ..utils.gen_utils import (
     visualize_gen_image,
     visualize_latent_space,
-    compute_fid_complete,
+    compute_FID_and_IS,
+    compute_real_IS,
     make_module_dp,
     get_noise_multiplier,
     compute_epoch_lipschitz_constant,
@@ -84,7 +85,7 @@ LATENT_DIM = args.latent_dim
 IDENTIFIER = args.identifier
 NUM_CLIENTS = args.num_clients
 NUM_CLASSES = 2 * args.num_clients
-IDENTIFIER_FOLDER = f"fed_align/{IDENTIFIER}"
+IDENTIFIER_FOLDER = f"fed_align_{args.data_type}/{IDENTIFIER}"
 if not os.path.exists(IDENTIFIER_FOLDER):
     os.makedirs(IDENTIFIER_FOLDER)
 
@@ -478,7 +479,9 @@ def main():
             )
 
             global_val_loss, global_val_accu, global_clf_loss = 0, 0, 0
-            global_fid = compute_fid_complete(testloader_wthout_ol, model, device, None)
+            global_fid, IS_mean, _ = compute_FID_and_IS(
+                testloader_wthout_ol, model, device, None, 32
+            )
             lip_cons_model = compute_epoch_lipschitz_constant(
                 model, testloader_wthout_ol, device, mode="complete"
             )
@@ -486,7 +489,13 @@ def main():
                 model, testloader_wthout_ol, device, mode="decoder"
             )
             metrics, _ = evaluate_vae_encoder_split(model, testloader_wthout_ol, device)
-
+            latent_reps_wthout_ol = visualize_latent_space(
+                model,
+                testloader_wthout_ol,
+                device,
+                filename=f"server_eval_wo_{server_round}",
+                folder=IDENTIFIER_FOLDER,
+            )
             arbitrary_samples = sample_and_visualize(
                 model,
                 device,
@@ -505,6 +514,11 @@ def main():
                         if isinstance(latent_reps, str)
                         else latent_reps
                     ),
+                    f"global_latent_rep_wo_outlier": (
+                        wandb.Image(latent_reps_wthout_ol)
+                        if isinstance(latent_reps_wthout_ol, str)
+                        else latent_reps_wthout_ol
+                    ),
                     f"global_arbitrary_samples": wandb.Image(arbitrary_samples),
                     # f"global_val_loss": global_val_loss,
                     # f"global_val_accu": global_val_accu,
@@ -512,12 +526,9 @@ def main():
                     f"global_lip_cons_model": lip_cons_model,
                     f"global_lip_cons_dec": lip_cons_dec,
                     f"global_fid": global_fid,
+                    f"global_IS_mean": IS_mean,
                     f"global_accuracy": metrics["accuracy"],
                     f"global_f1": metrics["f1"],
-                    # f"global_psnr": global_psnr,
-                    # f"global_ssim": global_ssim,
-                    # f"global_fid": global_fid,
-                    # f"global_fc": global_fc,
                     f"server_round": server_round,
                 },
                 step=server_round,

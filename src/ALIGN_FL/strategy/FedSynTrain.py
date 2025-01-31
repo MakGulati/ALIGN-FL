@@ -20,7 +20,7 @@ from flwr.server.client_proxy import ClientProxy
 from flwr.server.strategy import FedAvg
 import wandb
 
-from simpli_represent.utils.basic_utils import (
+from ..utils.basic_utils import (
     set_params_return,
     get_weights,
     create_subset_data,
