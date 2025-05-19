@@ -1,16 +1,26 @@
 import argparse
 from collections import OrderedDict
 from typing import Dict, Tuple, List
-from torch.utils.data import DataLoader, SubsetRandomSampler, ConcatDataset
-import os
-import sys
+import ray
+from torch.utils.data import DataLoader
+
 import torch
+import torch.nn.functional as F
+
 import flwr as fl
-from flwr.common import Metrics, ndarrays_to_parameters, ndarray_to_bytes
+from flwr.common import Metrics, ndarrays_to_parameters
 from flwr.common.logger import configure
 from flwr.common.typing import Scalar
-from ..strategy.FedSynTrain import Fed_Syntrain
+from torch.utils.data import DataLoader, SubsetRandomSampler, ConcatDataset
 import math
+import copy
+import glob
+import shutil
+import wandb
+import time
+import os
+import sys
+import numpy as np
 
 from ..utils.basic_utils import (
     load_weights,
@@ -25,34 +35,32 @@ from ..utils.gen_utils import (
     visualize_gen_image,
     visualize_latent_space,
     compute_FID_and_IS,
-    compute_real_IS,
     make_module_dp,
     get_noise_multiplier,
     compute_epoch_lipschitz_constant,
     evaluate_vae_encoder_split,
+    standard_local_model_train_moon,
 )
 from ..utils.gen_utils import (
     VAE,
-    local_model_train_only,
     SimpleVAE,
-    local_model_train_only_with_dp,
-    local_model_train_only_enc_penalty,
 )
 from ..utils.utils_server import sample_and_visualize, set_seed
-import numpy as np
-import ray
+from ..strategy.HybridMoonAlignStrategy import HybridMoonAlignStrategy
 
+EPSILON = 10
 DELTA = 1e-5
 EPOCHS = 10
 BATCH_SIZE = 128
-parser = argparse.ArgumentParser(description="Flower Simulation with PyTorch")
-
+parser = argparse.ArgumentParser(
+    description="Hybrid MOON-ALIGN Federated Learning with PyTorch"
+)
 
 parser.add_argument(
     "--num_rounds", "-r", type=int, default=10, help="Number of FL rounds."
 )
 parser.add_argument(
-    "--lambda_lip", "-lip", type=float, default=0.5, help="lambda for lip penalty."
+    "--lambda_lip", "-lip", type=float, default=0, help="lambda for lip penalty."
 )
 parser.add_argument(
     "--identifier", "-i", type=str, required=True, help="Name of experiment."
@@ -68,11 +76,29 @@ parser.add_argument(
     "--dp_type",
     "-dp",
     type=str,
-    help=" which kind of gradient clipping dp: full_dp, dec_dp, no_dp.",
+    help="Which kind of gradient clipping dp: full_dp, dec_dp, no_dp.",
     required=True,
 )
 parser.add_argument(
     "--clt_net_type", "-cnt", type=str, default="vae", help="Client net VAE or GAN."
+)
+parser.add_argument(
+    "--temperature",
+    type=float,
+    default=0.5,
+    help="Temperature for contrastive loss",
+)
+parser.add_argument(
+    "--mu",
+    type=float,
+    default=1.0,
+    help="Coefficient for contrastive loss",
+)
+parser.add_argument(
+    "--buffer_size",
+    type=int,
+    default=5,
+    help="Size of the model buffer for contrastive learning",
 )
 parser.add_argument(
     "--synthetic_samples",
@@ -93,14 +119,10 @@ parser.add_argument(
     help="Weight for KL divergence loss term",
 )
 parser.add_argument(
-    "--epsilon",
-    type=int,
-    default=10,
-    help="Epsilon value for differential privacy",
+    "--no_averaging",
+    action="store_true",
+    help="If set, server maintains a stateful model across rounds (ALIGN_FL style) without FedAvg",
 )
-
-
-import wandb
 
 args = parser.parse_args()
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -108,13 +130,13 @@ LATENT_DIM = args.latent_dim
 IDENTIFIER = args.identifier
 NUM_CLIENTS = args.num_clients
 NUM_CLASSES = 2 * args.num_clients
-IDENTIFIER_FOLDER = f"align_fl_{args.data_type}/{IDENTIFIER}"
+IDENTIFIER_FOLDER = f"hybrid_moon_align/{IDENTIFIER}"
 if not os.path.exists(IDENTIFIER_FOLDER):
     os.makedirs(IDENTIFIER_FOLDER)
 
-
 configure(identifier=IDENTIFIER, filename=f"{IDENTIFIER_FOLDER}/training_logs.log")
 set_seed(42)
+
 # Download dataset and partition it
 if args.num_clients == 2:
     _, valsets, _ = non_iid_train_iid_test_less_samples(
@@ -167,7 +189,6 @@ class dpSimpleVAE(SimpleVAE):
 class only_dec_dp_SimpleVAE(SimpleVAE):
     def __init__(self, input_dim, latent_dim):
         super(only_dec_dp_SimpleVAE, self).__init__(input_dim, latent_dim)
-
         make_module_dp(self.decoder)
 
     def forward(self, x):
@@ -176,12 +197,21 @@ class only_dec_dp_SimpleVAE(SimpleVAE):
         return self.decode(z), mu, logvar
 
 
+# Flower client, adapted from Pytorch quickstart example
 class FlowerClient(fl.client.NumPyClient):
     def __init__(self, trainset, valset, noise_multiplier, cid):
         self.trainset = trainset
         self.valset = valset
         self.cid = cid
         self.noise_multiplier = noise_multiplier
+        self.prev_models = []  # Store previous model versions for contrastive learning
+
+        # Create client-specific folder for model storage
+        self.models_folder = f"{IDENTIFIER_FOLDER}/client_{self.cid}_models"
+        os.makedirs(self.models_folder, exist_ok=True)
+
+        # Load previous models if they exist
+        self._load_prev_models()
 
         # Instantiate model
         if args.clt_net_type == "vae" and args.dp_type == "full_dp":
@@ -189,12 +219,12 @@ class FlowerClient(fl.client.NumPyClient):
                 input_dim=784,
                 latent_dim=LATENT_DIM,
             )
-        if args.clt_net_type == "vae" and args.dp_type == "dec_dp":
+        elif args.clt_net_type == "vae" and args.dp_type == "dec_dp":
             self.model = only_dec_dp_SimpleVAE(
                 input_dim=784,
                 latent_dim=LATENT_DIM,
             )
-        if args.clt_net_type == "vae" and args.dp_type == "no_dp":
+        elif args.clt_net_type == "vae" and args.dp_type == "no_dp":
             self.model = SimpleVAE(
                 input_dim=784,
                 latent_dim=LATENT_DIM,
@@ -204,86 +234,53 @@ class FlowerClient(fl.client.NumPyClient):
             input_dim=784,
             latent_dim=LATENT_DIM,
         )
+
         # Determine device
         self.device = DEVICE
-        self.model.to(self.device)
-        self.global_model.to(self.device)
-        initial_weights = [
-            val.cpu().numpy() for _, val in self.model.state_dict().items()
-        ]
-
-        save_weights(
-            initial_weights,
-            f"{IDENTIFIER_FOLDER}/model_params_cid_{self.cid}_server_round_{0}.npz",
-        )
+        self.model.to(DEVICE)
 
     def get_parameters(self, config):
+        """Get parameters of the local model."""
         return [val.cpu().numpy() for _, val in self.model.state_dict().items()]
 
     def fit(self, parameters, config):
-        if config["allow_agg"]:
-            set_params(self.model, parameters)
-        else:
+        """Train the model on the local dataset."""
+        # Update local model with global parameters
+        set_params(self.model, parameters)
 
-            loaded_model = load_weights(
-                f"{IDENTIFIER_FOLDER}/model_params_cid_{self.cid}_server_round_{config['server_round']-1}.npz"
-            )
-            set_params(self.model, loaded_model)
-        config["noise_multiplier"] = self.noise_multiplier
-        print(f"client {self.cid} training and nm={config['noise_multiplier']}")
+        # Update global model with the same parameters for contrastive learning
+        self.global_model = set_params_return(self.global_model, parameters)
+
+        # Add client ID to config
         config["cid"] = self.cid
-        # client training
-        if args.dp_type == "full_dp" or args.dp_type == "dec_dp":
-            all_losses, trained_model = local_model_train_only_with_dp(
-                self.trainset,
-                self.model,
-                config,
-            )
-        else:
-            all_losses, trained_model = local_model_train_only(
-                self.trainset,
-                self.model,
-                config,
-            )
-        assert trained_model == self.model, "Model is not the same"
+        config["temperature"] = args.temperature
+        config["mu"] = args.mu
+        config["folder"] = IDENTIFIER_FOLDER
+        print(f"Client {self.cid} has {len(self.prev_models)} previous models")
+
+        # Train the model using MOON approach
+        all_losses, trained_model = standard_local_model_train_moon(
+            self.trainset, self.model, config, self.global_model, self.prev_models
+        )
+        assert trained_model == self.model, "Model training failed"
+
+        # Save model parameters for debugging
         save_weights(
             get_weights(self.model),
             f"{IDENTIFIER_FOLDER}/model_params_cid_{self.cid}_server_round_{config.get('server_round')}.npz",
         )
+
         # Set a fixed seed for reproducibility
         seed = 42
         torch.manual_seed(seed)
 
+        # Prepare validation dataset
         combine_valset = ConcatDataset([self.valset, outlier_dataset])
-
-        # Create a list of indices for the dataset
         indices = list(range(len(combine_valset)))
-
-        # Create a SubsetRandomSampler with the indices
         sampler = SubsetRandomSampler(indices)
-
         val_dataloader = DataLoader(combine_valset, batch_size=64, sampler=sampler)
 
-        # true_img, gen_img = visualize_gen_image(
-        #     self.model,
-        #     val_dataloader,
-        #     self.device,
-        #     f'for_client_{self.cid}_train_at_round_{config.get("server_round")}',
-        #     folder=IDENTIFIER_FOLDER,
-        #     batch_size=64,
-        # )
-        ft_global_model = set_params_return(self.global_model, parameters)
-        # true_img_ft_glb, gen_img_ft_glb = visualize_gen_image(
-        #     ft_global_model,
-        #     val_dataloader,
-        #     self.device,
-        #     f'for_client_{self.cid}_global_train_at_round_{config.get("server_round")}',
-        #     folder=IDENTIFIER_FOLDER,
-        #     batch_size=64,
-        # )
-        assert ft_global_model != self.model, "Global model is same as local model"
-        # latent representation of finutuned global model
-
+        # Visualize latent space
         latent_rep = visualize_latent_space(
             self.model,
             val_dataloader,
@@ -292,43 +289,91 @@ class FlowerClient(fl.client.NumPyClient):
             folder=IDENTIFIER_FOLDER,
         )
 
-        print(f"client {self.cid} done training")
-        print(len(self.trainset))
-
+        # Prepare metrics
         metrics = {
             "cid": self.cid,
-            # "true_image": true_img,
-            # "gen_image": gen_img,
             "latent_rep": latent_rep,
-            # "true_image_ft_glb": true_img_ft_glb,
-            # "gen_image_ft_glb": gen_img_ft_glb,
             "client_round": config["server_round"],
         }
         metrics.update(all_losses)
 
+        # Store a copy of the current model for future contrastive learning
+        # Maintain only the last few models as specified by buffer size
+        if len(self.prev_models) >= args.buffer_size:
+            self.prev_models.pop(0)  # Remove oldest model
+
+        # Add current model to previous models
+        self.prev_models.append(copy.deepcopy(self.model))
+
+        # Save models to disk for persistence between rounds
+        self._save_prev_models(config.get("server_round", 0))
+
+        print(
+            f"Client {self.cid} now has {len(self.prev_models)} previous models saved"
+        )
+
+        # Return updated model parameters and metrics
         return (
             self.get_parameters({}),
-            len(self.trainset),  # placeholder for num_samples
+            len(self.trainset),
             metrics,
         )
 
-    def evaluate(self, parameters, config):
-        # TODO: Implement evaluation
-        # Construct dataloader
-        # valloader = DataLoader(self.valset, batch_size=64)
+    def _save_prev_models(self, server_round):
+        """Save previous models to disk"""
+        for idx, model in enumerate(self.prev_models):
+            model_path = f"{self.models_folder}/model_round_{server_round}_idx_{idx}.pt"
+            torch.save(model.state_dict(), model_path)
 
-        # # Evaluate
-        # set_params(self.model, parameters)
+        # Save list of model paths for loading
+        model_list_path = f"{self.models_folder}/model_list.txt"
+        with open(model_list_path, "w") as f:
+            for idx in range(len(self.prev_models)):
+                f.write(f"model_round_{server_round}_idx_{idx}.pt\n")
+
+    def _load_prev_models(self):
+        """Load previous models from disk if they exist"""
+        model_list_path = f"{self.models_folder}/model_list.txt"
+        if not os.path.exists(model_list_path):
+            print(f"No previous models found for client {self.cid}")
+            return
+
+        # Clear existing models
+        self.prev_models = []
+
+        # Load model list
+        with open(model_list_path, "r") as f:
+            model_files = f.read().splitlines()
+
+        # Load each model
+        for model_file in model_files:
+            model_path = f"{self.models_folder}/{model_file}"
+            if os.path.exists(model_path):
+                # Create a new model instance
+                model = SimpleVAE(input_dim=784, latent_dim=LATENT_DIM)
+                model.load_state_dict(torch.load(model_path))
+                self.prev_models.append(model)
+
+        print(f"Loaded {len(self.prev_models)} previous models for client {self.cid}")
+
+    def evaluate(self, parameters, config):
+        """Evaluate the model on the local test dataset."""
+        # Update model with global parameters
+        set_params(self.model, parameters)
+
+        # Prepare test dataloader
+        testloader = DataLoader(self.valset, batch_size=64)
         loss, accuracy, clf_loss = 0, 0, 0
 
+        # Evaluate
         # Return statistics
         return (
             float(loss),
             1,
             {
-                # "accuracy": float(accuracy),
-                # "cid": self.cid,
-                # "clf_loss": clf_loss,
+                "accuracy": float(accuracy),
+                "cid": self.cid,
+                "local_val_loss": float(loss),
             },
         )
 
@@ -336,16 +381,14 @@ class FlowerClient(fl.client.NumPyClient):
 def get_client_fn(train_partitions, test_partitions, noise_multipliers):
     """Return a function to construct a client.
 
-    The VirtualClientEngine will exectue this function whenever a client is sampled by
+    The VirtualClientEngine will execute this function whenever a client is sampled by
     the strategy to participate.
     """
 
     def client_fn(cid: str) -> fl.client.Client:
         """Construct a FlowerClient with its own dataset partition."""
-
         # Extract partition for client with id = cid
         trainset, valset = train_partitions[int(cid)], test_partitions[int(cid)]
-
         # Create and return client
         return FlowerClient(
             trainset, valset, noise_multipliers[int(cid)], int(cid)
@@ -364,32 +407,145 @@ def set_params(model: torch.nn.ModuleList, params: List[fl.common.NDArrays]):
 def weighted_average(metrics: List[Tuple[int, Metrics]]) -> Metrics:
     """Aggregation function for (federated) evaluation metrics, i.e. those returned by
     the client's evaluate() method."""
-
-    weighted_metrics = {
-        key: [
-            num_examples * m[key]
-            for num_examples, m in metrics
-            if isinstance(m[key], float)
-        ]
-        for num_examples, m in metrics
-        for key in m
-        if isinstance(m[key], float)
-    }
+    # Multiply accuracy of each client by number of examples used
+    accuracies = [num_examples * m["accuracy"] for num_examples, m in metrics]
     examples = [num_examples for num_examples, _ in metrics]
 
-    return {key: sum(value) / sum(examples) for key, value in weighted_metrics.items()}
+    # Aggregate and return custom metric (weighted average)
+    return {"accuracy": sum(accuracies) / sum(examples)}
+
+
+def cleanup_ray_sessions_during_training():
+    """Clean up Ray session directories during training to free up space"""
+    import subprocess
+
+    try:
+        # Get Ray temp directory location
+        ray_temp_dir = ray._private.utils.get_ray_temp_dir()
+
+        # Check current disk usage on the Ray temp directory
+        df_output = subprocess.check_output(["df", "-h", ray_temp_dir]).decode()
+        usage_line = [
+            line
+            for line in df_output.split("\n")
+            if ray_temp_dir in line or "/tmp" in line
+        ]
+
+        # Only clean if disk usage is high (over 80%)
+        if usage_line and (
+            "8[0-9]%" in usage_line[0]
+            or "9[0-9]%" in usage_line[0]
+            or "100%" in usage_line[0]
+        ):
+            print(f"WARNING: High disk usage detected in Ray temp dir: {usage_line[0]}")
+
+            # Find the current session directory
+            today = time.strftime("%Y-%m-%d")
+            ray_session_dirs = glob.glob(f"{ray_temp_dir}/session_{today}*")
+
+            for session_dir in ray_session_dirs:
+                # Clean object store
+                object_store = f"{session_dir}/object_store"
+                if os.path.exists(object_store):
+                    objects = glob.glob(f"{object_store}/*")
+                    # Sort by modification time and remove oldest 30%
+                    if objects:
+                        objects.sort(key=lambda x: os.path.getmtime(x))
+                        num_to_remove = max(1, int(len(objects) * 0.3))
+                        for obj in objects[:num_to_remove]:
+                            try:
+                                os.remove(obj)
+                                print(f"Removed Ray object: {obj}")
+                            except (PermissionError, OSError) as e:
+                                print(f"Could not remove {obj}: {e}")
+
+            print("Finished cleaning Ray sessions during training")
+    except Exception as e:
+        print(f"Error cleaning Ray sessions during training: {e}")
+
+
+# Main function
+def cleanup_client_models():
+    """Clean up previous model files from all clients after a run completes"""
+    import shutil
+    import subprocess
+    import time
+
+    print("Cleaning up client model files and Ray session directories...")
+
+    # Get all client model directories
+    client_dirs = glob.glob(f"{IDENTIFIER_FOLDER}/client_*_models")
+
+    for client_dir in client_dirs:
+        if os.path.exists(client_dir):
+            print(f"Removing model files from {client_dir}")
+            # Option 1: Remove individual model files but keep the directory structure
+            model_files = glob.glob(f"{client_dir}/*.pt")
+            for file in model_files:
+                os.remove(file)
+
+            # Also remove the model list file
+            if os.path.exists(f"{client_dir}/model_list.txt"):
+                os.remove(f"{client_dir}/model_list.txt")
+
+            # Option 2 (alternative): Remove the entire directory
+            # shutil.rmtree(client_dir)
+
+    # Clean up Ray session directories
+    try:
+        # Get Ray temp directory location
+        ray_temp_dir = ray._private.utils.get_ray_temp_dir()
+        ray_session_dirs = glob.glob(f"{ray_temp_dir}/session_*")
+
+        today = time.strftime("%Y-%m-%d")
+        old_sessions = [d for d in ray_session_dirs if today not in d]
+
+        # Remove old session directories that aren't from today
+        for session_dir in old_sessions:
+            print(f"Removing old Ray session directory: {session_dir}")
+            try:
+                shutil.rmtree(session_dir)
+            except (PermissionError, OSError) as e:
+                print(f"Could not remove {session_dir}: {e}")
+
+        # For today's sessions, check disk usage and clean up if needed
+        for session_dir in [d for d in ray_session_dirs if today in d]:
+            try:
+                # Check disk usage with df
+                df_output = subprocess.check_output(["df", "-h", session_dir]).decode()
+                if "95%" in df_output or "9[6-9]%" in df_output or "100%" in df_output:
+                    print(
+                        f"Session directory {session_dir} is almost full, cleaning up object store"
+                    )
+                    object_store = f"{session_dir}/object_store"
+                    if os.path.exists(object_store):
+                        objects = glob.glob(f"{object_store}/*")
+                        # Sort by modification time and remove oldest 50%
+                        objects.sort(key=lambda x: os.path.getmtime(x))
+                        for obj in objects[: len(objects) // 2]:
+                            try:
+                                os.remove(obj)
+                                print(f"Removed object: {obj}")
+                            except (PermissionError, OSError):
+                                pass
+            except Exception as e:
+                print(f"Error checking/cleaning session {session_dir}: {e}")
+
+    except Exception as e:
+        print(f"Error cleaning Ray sessions: {e}")
+
+    print("Cleanup completed")
 
 
 def main():
     # Parse input arguments
     run = wandb.init(
         entity="mak",
-        group="align-fl",
+        group="hybrid-moon-align",
         reinit=True,
     )
 
-    samples_per_class = wandb.config["sample_per_class"]
-    print(f"running these hparams-> {wandb.config}")
+    print(f"Running with hyperparameters: {wandb.config}")
     wandb.define_metric("server_round")
     wandb.define_metric("global_*", step_metric="server_round")
     wandb.define_metric("generated_*", step_metric="server_round")
@@ -397,6 +553,9 @@ def main():
     wandb.define_metric("train_*", step_metric="client_round")
     wandb.define_metric("eval_*", step_metric="client_round")
 
+    samples_per_class = wandb.config["sample_per_class"]
+
+    # Setup alignment dataloader for global model evaluation
     ALIGNMENT_DATALOADER = alignment_dataloader(
         samples_per_class=samples_per_class,
         batch_size=samples_per_class * NUM_CLASSES,
@@ -413,6 +572,8 @@ def main():
             "lambda_lip": wandb.config["lambda_lip"],
             "max_grad_norm": wandb.config["max_grad_norm"],
             "batch_size": wandb.config["batch_size"],
+            "temperature": args.temperature,
+            "mu": args.mu,
             "server_round": server_round,
             "total_rounds": args.num_rounds,
             "latent_dim": LATENT_DIM,
@@ -432,24 +593,13 @@ def main():
         }
         return config
 
-    server_config = {
-        "latent_dim": LATENT_DIM,
-        "num_tasks": NUM_CLIENTS,
-        "input_dim": 784,
-        "hidden_dim": 256,
-        "global_epochs": args.server_epochs,  # Use command-line argument
-        "global_lambda_kl": args.lambda_kl,  # Use command-line argument
-        "global_batch_size": 128,
-        "global_sample_size": args.synthetic_samples,  # Use command-line argument
-        "clt_net_type": args.clt_net_type,
-        "folder": IDENTIFIER_FOLDER,
-    }
-
     def get_evaluate_fn(testset):
         """Return an evaluation function for centralized evaluation."""
 
         def evaluate(
-            server_round: int, parameters: fl.common.NDArrays, config: Dict[str, Scalar]
+            server_round: int,
+            parameters: fl.common.NDArrays,
+            config: Dict[str, Scalar],
         ):
             """Use the entire test set for evaluation."""
 
@@ -501,7 +651,6 @@ def main():
                 folder=IDENTIFIER_FOLDER,
             )
 
-            global_val_loss, global_val_accu, global_clf_loss = 0, 0, 0
             global_fid, IS_mean, _ = compute_FID_and_IS(
                 testloader_wthout_ol, model, device, None, 32
             )
@@ -543,13 +692,9 @@ def main():
                         else latent_reps_wthout_ol
                     ),
                     f"global_arbitrary_samples": wandb.Image(arbitrary_samples),
-                    # f"global_val_loss": global_val_loss,
-                    # f"global_val_accu": global_val_accu,
-                    # f"global_clf_loss": global_clf_loss,
                     f"global_lip_cons_model": lip_cons_model,
                     f"global_lip_cons_dec": lip_cons_dec,
                     f"global_fid": global_fid,
-                    f"global_IS_mean": IS_mean,
                     f"global_accuracy": metrics["accuracy"],
                     f"global_f1": metrics["f1"],
                     f"server_round": server_round,
@@ -557,43 +702,62 @@ def main():
                 step=server_round,
             )
 
+            return float(global_fid), metrics
+
         return evaluate
 
+    # Configure noise multipliers for DP
     if args.dp_type == "full_dp" or args.dp_type == "dec_dp":
         noise_multipliers = []
         for trainset in trainsets:
             sampling_prob = BATCH_SIZE / len(trainset)
             steps = math.ceil(len(trainset) / BATCH_SIZE) * EPOCHS * args.num_rounds
             noise_multiplier = get_noise_multiplier(
-                eps=args.epsilon, delta=DELTA, steps=steps, sampling_prob=sampling_prob
+                eps=EPSILON, delta=DELTA, steps=steps, sampling_prob=sampling_prob
             )
             noise_multipliers.append(noise_multiplier)
     else:
         noise_multipliers = [0] * len(trainsets)
-    # initial model for global model
+
+    # Initialize VAE model
     initial_vae = SimpleVAE(
         input_dim=784,
         latent_dim=LATENT_DIM,
     )
 
     initial_params = ndarrays_to_parameters(get_weights(initial_vae))
-    # trained_pca_model = train_save_pca_model(
-    #     initial_vae, ALIGNMENT_DATALOADER, DEVICE, IDENTIFIER_FOLDER
-    # )
-    strategy = Fed_Syntrain(
+
+    # Configure server-side parameters
+    server_config = {
+        "input_dim": 784,
+        "latent_dim": LATENT_DIM,
+        "global_epochs": args.server_epochs,
+        "global_batch_size": 64,
+        "global_lambda_kl": args.lambda_kl,  # Fixed parameter name to match utils_server.py
+        "global_sample_size": 5000,
+        "synthetic_samples_per_client": args.synthetic_samples,
+        "clt_net_type": "vae",
+        "num_tasks": NUM_CLIENTS,
+        "use_fedavg": not args.no_averaging,  # If no_averaging is True, don't use FedAvg
+    }
+
+    # Create strategy
+    strategy = HybridMoonAlignStrategy(
         initial_parameters=initial_params,
         min_fit_clients=NUM_CLIENTS,
         min_available_clients=NUM_CLIENTS,
         min_evaluate_clients=NUM_CLIENTS,
         on_fit_config_fn=fit_config,
         on_evaluate_config_fn=eval_config,
-        evaluate_metrics_aggregation_fn=weighted_average,  # Aggregate federated metrics
-        evaluate_fn=get_evaluate_fn(valsets[-1]),  # Global evaluation function
+        evaluate_metrics_aggregation_fn=weighted_average,
+        evaluate_fn=get_evaluate_fn(valsets[-1]),
+        model_buffer_size=args.buffer_size,
         device=DEVICE,
-        alignment_dataloader=ALIGNMENT_DATALOADER,
+        server_config=server_config,
         folder=IDENTIFIER_FOLDER,
-        svr_cfg=server_config,
+        cleanup_fn=cleanup_ray_sessions_during_training,
     )
+
     # Resources to be assigned to each virtual client
     client_resources = {
         "num_cpus": 36 / NUM_CLIENTS,
@@ -608,33 +772,34 @@ def main():
         config=fl.server.ServerConfig(num_rounds=args.num_rounds),
         strategy=strategy,
         ray_init_args={
-            "include_dashboard": True,  # we need this one for tracking
+            "include_dashboard": True,  # needed for tracking
         },
     )
-    # Clean up .npz and .joblib files from the folder
-    for file in os.listdir(IDENTIFIER_FOLDER):
-        if file.endswith(".npz") or file.endswith(".joblib"):
-            os.remove(os.path.join(IDENTIFIER_FOLDER, file))
+
+    # Clean up client model files after simulation
+    cleanup_client_models()
+
     ray.shutdown()
     wandb.finish()
 
 
 if __name__ == "__main__":
-
     sweep_config = {
         "method": "grid",
-        "metric": {"name": "global_ssim", "goal": "maximize"},
+        "metric": {"name": "global_accuracy", "goal": "maximize"},
         "parameters": {
             # client config
             "local_epochs": {"values": [EPOCHS]},
             "batch_size": {"values": [BATCH_SIZE]},
-            "lambda_kl": {"values": [args.lambda_kl]},  # Use command-line argument
+            "lambda_kl": {"values": [args.lambda_kl]},  # Use command line arg value
             "lambda_lip": {"values": [args.lambda_lip]},
             "sample_per_class": {"values": [20]},
             "max_grad_norm": {"values": [1]},
-            # server config - not needed anymore since we use command-line args directly
         },
     }
     sweep_id = wandb.sweep(sweep=sweep_config, project=IDENTIFIER)
 
     wandb.agent(sweep_id, function=main, count=1)
+
+    # Clean up client model files after simulation
+    cleanup_client_models()

@@ -44,5 +44,10 @@ fed_align_*/
 align_fl_*
 fed_avg/
 fed_prox/
+hybrid_moon_align/
+moon_fl/
 wandb/
 *.log
+
+# experiments 
+examples/

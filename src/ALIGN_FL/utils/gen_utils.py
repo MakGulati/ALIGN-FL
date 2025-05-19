@@ -4,6 +4,12 @@ import torchvision.transforms as transforms
 from torchvision.models import inception_v3
 from torchmetrics.image.inception import InceptionScore
 
+# Set Matplotlib backend to avoid GUI warnings
+import matplotlib
+
+matplotlib.use("Agg")
+from matplotlib import pyplot as plt
+
 from scipy.linalg import sqrtm
 
 import numpy as np
@@ -12,6 +18,9 @@ import torch.nn.functional as F
 from sklearn.neural_network import MLPClassifier
 from torchvision.utils import save_image
 from sklearn.decomposition import PCA
+import matplotlib
+
+matplotlib.use("Agg")  # Use non-interactive backend to avoid thread issues
 from matplotlib import pyplot as plt
 import random
 import os
@@ -850,6 +859,11 @@ def visualize_gen_image(
 
 
 def visualize_latent_space(model, test_loader, device, filename=None, folder=None):
+    # Set the backend to non-interactive Agg to avoid GUI warnings
+    import matplotlib
+
+    matplotlib.use("Agg")
+
     model.eval()
     z_points = []
     labels = []
@@ -1450,3 +1464,227 @@ def plot_latent_stats(stats, title):
 plot_latent_stats(latent_stats['mu'], 'Distribution of μ across Latent Dimensions')
 plot_latent_stats(latent_stats['log_var'], 'Distribution of log_var across Latent Dimensions')
 """
+import copy
+
+def standard_local_model_train_moon(
+    local_trainset, model, config, global_model, prev_models
+):
+    """
+    Train a local model using MOON (Model-Contrastive) approach with VAEs
+
+    Args:
+        local_trainset: Local training dataset
+        model: Current local model (VAE)
+        config: Training configuration
+        global_model: Global model for contrastive learning
+        prev_models: List of previous models for negative samples
+
+    Returns:
+        dict: Training losses
+        model: Trained model
+    """
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    global_model = copy.deepcopy(model)
+    global_model.to(device)
+    model.train()
+    global_model.eval()
+    all_latent_vectors = []
+
+    # Set up optimizer
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    # Get training parameters from config
+    num_epochs = config["local_epochs"]
+    lambda_kl = config["lambda_kl"]
+    lambda_lip = config["lambda_lip"]
+    mu = config.get("mu", 1.0)  # Coefficient for contrastive loss, default 1.0
+    temperature = config.get(
+        "temperature", 0.5
+    )  # Temperature for contrastive loss, default 0.5
+    latent_dim = config["latent_dim"]
+    cid = config.get("cid", 0)
+    folder = config.get("folder", "")
+    server_round = config.get("server_round", 0)
+
+    # Set up dataloader
+    local_dataloader = DataLoader(
+        local_trainset, batch_size=config["batch_size"], shuffle=True
+    )
+
+    # Move previous models to device
+    prev_models_device = []
+    for prev_model in prev_models:
+        prev_models_device.append(prev_model.to(device))
+
+    # Track all losses
+    total_train_loss = 0
+    total_mse = 0
+    total_kl_loss = 0
+    total_lip_loss = 0
+    total_contrastive_loss = 0
+    num_batches = 0
+    epoch_lip_constants = []
+
+    # Define cosine similarity function for contrastive loss
+    cos = torch.nn.CosineSimilarity(dim=-1)
+
+    for epoch in range(num_epochs):
+        epoch_train_loss = 0
+        epoch_mse = 0
+        epoch_kl_loss = 0
+        epoch_lip_loss = 0
+        epoch_contrastive_loss = 0
+        batch_count = 0
+
+        for batch_idx, data in enumerate(local_dataloader):
+            features = data[0].to(device)
+
+            optimizer.zero_grad()
+
+            # Forward pass through current model
+            recon_batch, mu, log_var = model(features)
+            z = model.reparameterize(mu, log_var)
+            all_latent_vectors.append(z.detach().cpu().numpy())
+
+            # Forward pass through global model (for contrastive loss)
+            with torch.no_grad():
+                _, global_mu, global_log_var = global_model(features)
+                global_z = global_model.reparameterize(global_mu, global_log_var)
+
+            # Compute VAE loss
+            vae_loss, mse, kl, lip_loss = mse_loss_function_with_gp(
+                model,
+                features,
+                recon_batch,
+                mu,
+                log_var,
+                lambda_kl,
+                use_gp=True if lambda_lip > 0 else False,
+                gradient_penalty_weight=lambda_lip,
+            )
+
+            # Get embeddings from previous models for negative samples
+            prev_z_list = []
+            for prev_model in prev_models_device:
+                with torch.no_grad():
+                    _, prev_mu, prev_log_var = prev_model(features)
+                    prev_z = prev_model.reparameterize(prev_mu, prev_log_var)
+                    prev_z_list.append(prev_z)
+
+            # Compute contrastive loss
+            contrastive_loss = torch.tensor(0.0, device=device)
+            if len(prev_z_list) > 0:  # Only compute if we have previous models
+                # Compute cosine similarity between current and global embeddings
+                pos_sim = cos(z, global_z).unsqueeze(-1)  # Shape: [batch_size, 1]
+
+                # Debug: check similarity values
+                print(
+                    f"Positive similarity stats: min={pos_sim.min().item():.4f}, max={pos_sim.max().item():.4f}, mean={pos_sim.mean().item():.4f}"
+                )
+
+                # Compute cosine similarities with previous models (negative samples)
+                neg_sims = []
+                for i, prev_z in enumerate(prev_z_list):
+                    neg_sim = cos(z, prev_z).unsqueeze(-1)  # Shape: [batch_size, 1]
+                    print(
+                        f"Negative similarity {i} stats: min={neg_sim.min().item():.4f}, max={neg_sim.max().item():.4f}, mean={neg_sim.mean().item():.4f}"
+                    )
+                    neg_sims.append(neg_sim)
+
+                # Concatenate all similarities
+                if neg_sims:  # Check if we have any negative samples
+                    neg_sims = torch.cat(
+                        neg_sims, dim=1
+                    )  # Shape: [batch_size, num_prev_models]
+                    logits = torch.cat(
+                        [pos_sim, neg_sims], dim=1
+                    )  # Shape: [batch_size, 1+num_prev_models]
+
+                    # Apply temperature scaling
+                    logits /= temperature
+
+                    # Labels: positive pair is the first one (index 0)
+                    labels = torch.zeros(features.size(0)).to(logits.device).long()
+
+                    # Compute cross entropy loss
+                    contrastive_loss = F.cross_entropy(logits, labels)
+            # Total loss: VAE loss + weighted contrastive loss
+            total_loss = vae_loss + mu * contrastive_loss
+            print(
+                f"Epoch {epoch}, Batch {batch_idx}, VAE Loss: {vae_loss.item()}, Contrastive Loss: {contrastive_loss.item()}"
+            )
+            # Ensure total_loss is a scalar for backward pass
+            if not torch.is_tensor(total_loss) or total_loss.dim() > 0:
+                total_loss = total_loss.sum()
+
+            # Backward pass
+            total_loss.backward()
+            optimizer.step()
+
+            # Track losses
+            epoch_train_loss += total_loss.item()
+            epoch_mse += mse.item()
+            epoch_kl_loss += kl.item()
+            epoch_lip_loss += lip_loss.item() if lambda_lip > 0 else 0
+            epoch_contrastive_loss += contrastive_loss.item()
+            batch_count += 1
+            num_batches += 1
+
+        # Average losses for the epoch
+        epoch_train_loss /= batch_count
+        epoch_mse /= batch_count
+        epoch_kl_loss /= batch_count
+        epoch_lip_loss /= batch_count if batch_count > 0 else 1
+        epoch_contrastive_loss /= batch_count if batch_count > 0 else 1
+
+        # Add to total losses
+        total_train_loss += epoch_train_loss
+        total_mse += epoch_mse
+        total_kl_loss += epoch_kl_loss
+        total_lip_loss += epoch_lip_loss
+        total_contrastive_loss += epoch_contrastive_loss
+
+        # Compute and log Lipschitz constant if needed
+        if lambda_lip > 0:
+            lip_constant = compute_epoch_lipschitz_constant(model)
+            epoch_lip_constants.append(lip_constant)
+            print(f"Epoch {epoch} Lipschitz constant: {lip_constant}")
+
+    # Calculate average losses
+    num_epochs_float = float(num_epochs)
+    avg_train_loss = total_train_loss / num_epochs_float
+    avg_mse = total_mse / num_epochs_float
+    avg_kl_loss = total_kl_loss / num_epochs_float
+    avg_lip_loss = total_lip_loss / num_epochs_float
+    avg_contrastive_loss = total_contrastive_loss / num_epochs_float
+
+    # Fit GMM on collected latent vectors for sampling (if we have any)
+    if all_latent_vectors:
+        all_latent_vectors = np.concatenate(all_latent_vectors, axis=0)
+        from sklearn.mixture import GaussianMixture
+        import joblib
+
+        gmm = GaussianMixture(n_components=10, covariance_type="diag", random_state=42)
+        gmm.fit(all_latent_vectors)
+
+        # Save GMM model if folder is provided
+        if folder:
+            joblib.dump(gmm, f"{folder}/gmm_c_{cid}_r{server_round}.joblib")
+
+    # Return all losses
+    all_loss = {
+        "local_total_train_loss": avg_train_loss,
+        "local_total_mse": avg_mse,
+        "local_total_kl_loss": avg_kl_loss,
+        "local_total_gp_loss": avg_lip_loss,
+        "local_total_contrastive_loss": avg_contrastive_loss,
+    }
+
+    # Move previous models back to CPU to save memory
+    for prev_model in prev_models_device:
+        prev_model.to("cpu")
+
+    global_model.to("cpu")
+
+    return all_loss, model
